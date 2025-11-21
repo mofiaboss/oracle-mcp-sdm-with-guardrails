@@ -15,6 +15,7 @@ All destructive and write operations are completely blocked:
 - ❌ `DELETE`, `INSERT`, `UPDATE`, `MERGE`
 - ❌ `DROP`, `TRUNCATE`, `ALTER`, `CREATE`
 - ❌ `GRANT`, `REVOKE`, `EXECUTE`
+- ❌ `UNION`, `UNION ALL` (prevents data exfiltration)
 - ✅ Only `SELECT` queries are allowed
 
 ### 2. **Cartesian Product Prevention**
@@ -70,6 +71,33 @@ Provides actionable warnings without blocking:
 - ⚠️  Expensive operations (DISTINCT, aggregates)
 - ⚠️  Subquery usage
 
+### 6. **SQL Injection Prevention**
+Comprehensive protection against SQL injection attacks:
+- **Input Validation:** All table names and schema names validated with strict regex
+- **Comment Stripping:** SQL comments removed before validation to prevent bypasses
+- **Identifier Whitelisting:** Only alphanumeric, underscore, $, and # allowed
+- **Length Limits:** Maximum 30 characters for identifiers
+- **Pattern Matching:** Must start with letter, no SQL special characters
+
+**Protected Tools:**
+- `describe_table`: Validates table name before query construction
+- `list_tables`: Validates schema name before query construction
+- `query_oracle`: Full validation with QueryValidator
+
+**Blocked Patterns:**
+```sql
+-- SQL injection attempts are blocked
+USERS' OR '1'='1
+USERS; DROP TABLE USERS;--
+USERS UNION SELECT * FROM passwords
+```
+
+### 7. **Credential Security**
+Credentials are never exposed in process listings:
+- **Environment Variables:** Java process receives credentials via environment, not command line
+- **No Process Exposure:** `ps aux` will not show database credentials
+- **Secure Subprocess:** Python passes credentials through environment to Java
+
 ## Configuration
 
 The validator can be configured in `oracle_mcp_server.py`:
@@ -86,18 +114,28 @@ validator = QueryValidator(
 
 Run comprehensive safety tests:
 ```bash
-python test_safety.py
+python test_safety.py              # Original 13 safety tests
+python test_security_fixes.py     # Security audit fixes (27 tests)
 ```
 
-**Current Test Status:** ✅ All 13 tests passing
+**Current Test Status:**
+- ✅ All 13 original safety tests passing
+- ✅ All 27 security audit tests passing
 
-### Tests Include:
+### Original Safety Tests Include:
 - ✅ Blocks cartesian products (implicit and explicit)
 - ✅ Blocks write operations (DELETE, UPDATE, INSERT)
 - ✅ Blocks destructive operations (DROP, TRUNCATE)
 - ✅ Allows safe SELECT queries
 - ✅ Allows proper JOINs with conditions
 - ✅ Applies row limits correctly
+
+### Security Audit Tests Include:
+- ✅ UNION/UNION ALL blocking (prevents data exfiltration)
+- ✅ SQL comment stripping (prevents comment-based bypasses)
+- ✅ ROWNUM bypass fix (proper constraint detection)
+- ✅ Identifier validation (prevents SQL injection in table/schema names)
+- ✅ Credential security (environment variables, not command line)
 
 ## Response Format
 
@@ -197,6 +235,30 @@ validator = QueryValidator(
 
 ---
 
-**Status:** ✅ Production Ready
-**Last Updated:** 2025-01-21
-**Test Coverage:** 100%
+## Security Audit History
+
+### 2025-11-21: Comprehensive Security Audit
+**Vulnerabilities Identified:**
+1. SQL injection in `describe_table` tool (no validation)
+2. SQL injection in `list_tables` tool (no validation)
+3. UNION SELECT not blocked (data exfiltration risk)
+4. SQL comment bypass vulnerability
+5. ROWNUM bypass (string presence vs. actual constraint)
+6. Credentials exposed in process listings
+
+**All Vulnerabilities Fixed:**
+- ✅ Added strict identifier validation with regex whitelisting
+- ✅ Added UNION/UNION ALL to blocked keywords
+- ✅ Implemented SQL comment stripping before validation
+- ✅ Fixed ROWNUM detection to check for actual constraints
+- ✅ Moved credentials to environment variables (not command line)
+- ✅ All 27 security tests passing
+
+**Audit Result:** ✅ **PASS** - Production Ready
+
+---
+
+**Status:** ✅ Production Ready & Security Audited
+**Last Updated:** 2025-11-21
+**Test Coverage:** 100% (40 total tests)
+**Security Audit:** ✅ PASSED

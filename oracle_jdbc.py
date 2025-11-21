@@ -90,21 +90,26 @@ class OracleJDBC:
         # Build classpath
         classpath = f".:{self.json_jar}:{self.jdbc_jar}"
 
-        # Run Java subprocess
+        # Set up environment with credentials (safer than command-line args)
+        import os
+        env = os.environ.copy()
+        env['ORACLE_USER'] = self.user
+        env['ORACLE_PASSWORD'] = self.password
+
+        # Run Java subprocess (credentials passed via environment, not command line)
         result = subprocess.run(
             [
                 str(self.java_bin),
                 "-cp", classpath,
                 "OracleQuery",
                 self.jdbc_url,
-                self.user,
-                self.password,
                 query
             ],
             cwd=str(self.work_dir),
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            env=env
         )
 
         # Parse JSON response

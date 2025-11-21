@@ -7,6 +7,7 @@ Works through StrongDM proxy on Apple Silicon.
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 from mcp.server import Server
 from mcp.types import (
@@ -29,6 +30,36 @@ server = Server("oracle-jdbc-server")
 # Global database connection and validator
 db: OracleJDBC = None
 validator: QueryValidator = None
+
+
+def validate_identifier(identifier: str, max_length: int = 30) -> bool:
+    """
+    Validate database identifier (table name, schema name, etc.).
+
+    Args:
+        identifier: The identifier to validate
+        max_length: Maximum allowed length
+
+    Returns:
+        True if valid, False otherwise
+    """
+    if not identifier:
+        return False
+
+    # Oracle identifier rules:
+    # - Must start with letter
+    # - Can contain letters, numbers, underscore, $, #
+    # - Max 30 chars (or 128 in 12.2+, but we use 30 for safety)
+    # - Case insensitive (we'll uppercase)
+    if len(identifier) > max_length:
+        return False
+
+    # Allow only safe characters: alphanumeric, underscore
+    # Block any SQL injection characters
+    if not re.match(r'^[A-Za-z][A-Za-z0-9_$#]*$', identifier):
+        return False
+
+    return True
 
 
 def init_db():
@@ -264,7 +295,18 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     text="Error: 'table_name' parameter is required"
                 )]
 
-            # Get table structure
+            # Validate table name to prevent SQL injection
+            if not validate_identifier(table_name):
+                return [TextContent(
+                    type="text",
+                    text=f"Error: Invalid table name '{table_name}'. Table names must start with a letter and contain only alphanumeric characters, underscores, $, or #."
+                )]
+
+            # Use uppercase for Oracle (case-insensitive but stored as uppercase)
+            safe_table_name = table_name.upper()
+
+            # Get table structure - using bind variables would be ideal but Oracle system tables
+            # don't support them, so we use validated identifiers instead
             query = f"""
                 SELECT
                     column_name,
@@ -273,7 +315,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     nullable,
                     data_default
                 FROM user_tab_columns
-                WHERE table_name = '{table_name.upper()}'
+                WHERE table_name = '{safe_table_name}'
                 ORDER BY column_id
             """
 
@@ -286,7 +328,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 WHERE constraint_name = (
                     SELECT constraint_name
                     FROM user_constraints
-                    WHERE table_name = '{table_name.upper()}'
+                    WHERE table_name = '{safe_table_name}'
                     AND constraint_type = 'P'
                 )
             """
@@ -294,7 +336,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             pk_columns = [row['COLUMN_NAME'] for row in db.query(pk_query)]
 
             response = {
-                "table_name": table_name.upper(),
+                "table_name": safe_table_name,
                 "columns": columns,
                 "primary_keys": pk_columns
             }
@@ -308,10 +350,18 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             schema = arguments.get("schema")
 
             if schema:
+                # Validate schema name to prevent SQL injection
+                if not validate_identifier(schema):
+                    return [TextContent(
+                        type="text",
+                        text=f"Error: Invalid schema name '{schema}'. Schema names must start with a letter and contain only alphanumeric characters, underscores, $, or #."
+                    )]
+
+                safe_schema = schema.upper()
                 query = f"""
                     SELECT table_name, owner
                     FROM all_tables
-                    WHERE owner = '{schema.upper()}'
+                    WHERE owner = '{safe_schema}'
                     ORDER BY table_name
                 """
             else:

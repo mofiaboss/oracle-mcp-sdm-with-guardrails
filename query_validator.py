@@ -52,6 +52,8 @@ class QueryValidator:
         r'\bCALL\b',
         r'\bGRANT\b',
         r'\bREVOKE\b',
+        r'\bUNION\s+ALL\b',  # Block UNION ALL for data exfiltration
+        r'\bUNION\b',        # Block UNION for data exfiltration
     ]
 
     def __init__(
@@ -72,6 +74,24 @@ class QueryValidator:
         self.max_rows = max_rows
         self.allow_cross_joins = allow_cross_joins
 
+    def _strip_sql_comments(self, query: str) -> str:
+        """
+        Strip SQL comments from query to prevent bypass via comment injection.
+
+        Args:
+            query: SQL query with potential comments
+
+        Returns:
+            Query with comments removed
+        """
+        # Remove single-line comments (-- ...)
+        query = re.sub(r'--[^\n]*', '', query)
+
+        # Remove multi-line comments (/* ... */)
+        query = re.sub(r'/\*.*?\*/', '', query, flags=re.DOTALL)
+
+        return query
+
     def validate(self, query: str) -> ValidationResult:
         """
         Validate a SQL query for safety.
@@ -82,6 +102,8 @@ class QueryValidator:
         Returns:
             ValidationResult with safety assessment
         """
+        # Strip comments first to prevent comment-based bypasses
+        query = self._strip_sql_comments(query)
         query_upper = query.upper()
         warnings = []
         complexity_score = 0
@@ -228,6 +250,32 @@ class QueryValidator:
         """Check if query has a WHERE clause."""
         return bool(re.search(r'\bWHERE\b', query_upper))
 
+    def _has_rownum_constraint(self, query: str) -> bool:
+        """
+        Check if query already has a ROWNUM constraint.
+
+        Args:
+            query: SQL query to check
+
+        Returns:
+            True if query has ROWNUM constraint, False otherwise
+        """
+        query_upper = query.upper()
+
+        # Look for ROWNUM in WHERE clause or comparison
+        # Match patterns like:
+        # - WHERE ROWNUM <= 100
+        # - AND ROWNUM < 1000
+        # - ROWNUM = 1
+        if re.search(r'\bROWNUM\s*[<>=]+\s*\d+', query_upper):
+            return True
+
+        # Check for ROWNUM in subquery wrapping pattern
+        if re.search(r'WHERE\s+ROWNUM\s*<=', query_upper):
+            return True
+
+        return False
+
     def wrap_with_row_limit(self, query: str) -> str:
         """
         Wrap query with ROWNUM limit to prevent massive result sets.
@@ -238,18 +286,19 @@ class QueryValidator:
         Returns:
             Query wrapped with ROWNUM limit
         """
-        query_upper = query.upper().strip()
+        query_stripped = query.strip()
+        query_upper = query_stripped.upper()
 
-        # If query already has ROWNUM, don't wrap
-        if 'ROWNUM' in query_upper:
-            return query
+        # If query already has proper ROWNUM constraint, don't wrap
+        if self._has_rownum_constraint(query_stripped):
+            return query_stripped
 
         # If query has ORDER BY, we need to preserve it
         if 'ORDER BY' in query_upper:
             # Wrap the entire query and apply ROWNUM in outer query
             return f"""
 SELECT * FROM (
-    {query}
+    {query_stripped}
 ) WHERE ROWNUM <= {self.max_rows}
 """.strip()
         else:
@@ -257,10 +306,10 @@ SELECT * FROM (
             # Check if query already has WHERE
             if 'WHERE' in query_upper:
                 # Add AND ROWNUM condition
-                return f"{query} AND ROWNUM <= {self.max_rows}"
+                return f"{query_stripped} AND ROWNUM <= {self.max_rows}"
             else:
                 # Add WHERE ROWNUM condition
-                return f"{query} WHERE ROWNUM <= {self.max_rows}"
+                return f"{query_stripped} WHERE ROWNUM <= {self.max_rows}"
 
 
 def main():

@@ -4,15 +4,28 @@ import org.json.JSONArray;
 
 public class OracleQuery {
     public static void main(String[] args) {
-        if (args.length < 4) {
-            System.err.println("Usage: java OracleQuery <url> <user> <password> <query>");
+        // Accept URL and query from command line, but get credentials from environment
+        // This prevents credentials from appearing in process listings
+        if (args.length < 2) {
+            System.err.println("Usage: java OracleQuery <url> <query>");
+            System.err.println("Credentials must be provided via ORACLE_USER and ORACLE_PASSWORD environment variables");
             System.exit(1);
         }
 
         String url = args[0];
-        String user = args[1];
-        String password = args[2];
-        String query = args[3];
+        String query = args[1];
+
+        // Get credentials from environment variables (not command line)
+        String user = System.getenv("ORACLE_USER");
+        String password = System.getenv("ORACLE_PASSWORD");
+
+        if (user == null || password == null) {
+            JSONObject error = new JSONObject();
+            error.put("success", false);
+            error.put("error", "ORACLE_USER and ORACLE_PASSWORD environment variables must be set");
+            System.out.println(error.toString());
+            System.exit(1);
+        }
 
         Connection conn = null;
         Statement stmt = null;

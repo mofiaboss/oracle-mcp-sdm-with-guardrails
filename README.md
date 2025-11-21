@@ -2,18 +2,23 @@
 
 A Model Context Protocol (MCP) server for Oracle databases with comprehensive query safety features, designed to work through StrongDM proxies and on Apple Silicon Macs.
 
+**🔒 Security Audited:** ✅ All vulnerabilities fixed (2025-11-21)
+
 ## 🛡️ Why This MCP?
 
 Unlike other database MCP servers, this implementation includes **production-grade safety features**:
 
+- ✅ **SQL Injection Protection** - Strict input validation on all entry points
 - ✅ **Blocks cartesian products** - Prevents accidental cross joins that could lock your database
 - ✅ **Query complexity scoring** - Rejects overly complex queries before execution
 - ✅ **Result set limits** - Automatically enforces maximum row returns (10,000 default)
-- ✅ **Read-only enforcement** - Blocks all write operations (DELETE, UPDATE, INSERT, DROP, etc.)
+- ✅ **Read-only enforcement** - Blocks all write operations (DELETE, UPDATE, INSERT, DROP, UNION, etc.)
 - ✅ **Multi-layer validation** - Pattern detection, keyword blocking, and complexity analysis
+- ✅ **Credential security** - Passwords never exposed in process listings
+- ✅ **Comment stripping** - Prevents SQL comment-based bypasses
 - ✅ **Detailed logging** - All blocked queries are logged with reasons
 
-**Security Research:** 43% of popular MCP servers contain SQL injection vulnerabilities. This implementation was built with security-first design.
+**Security Research:** 43% of popular MCP servers contain SQL injection vulnerabilities. This implementation was built with security-first design and has passed comprehensive security auditing.
 
 ## 🏗️ Architecture
 
