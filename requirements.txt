@@ -1,10 +1,8 @@
 # Oracle MCP Server Dependencies
+# Requires Python 3.10+
 
 # MCP Protocol
-mcp>=1.0.0
-
-# FastMCP for rapid development (optional)
-fastmcp>=0.1.0
+mcp
 
 # Note: Java and JDBC driver are not Python dependencies
 # Java 21+ required (install separately)

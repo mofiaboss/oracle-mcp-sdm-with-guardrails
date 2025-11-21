@@ -35,15 +35,28 @@ class OracleJDBC:
         self.password = password
 
         # Paths
-        self.java_home = Path("/opt/homebrew/opt/openjdk@21")
+        import os
+        self.java_home = Path(os.getenv("JAVA_HOME", "/opt/homebrew/opt/openjdk@21"))
         self.java_bin = self.java_home / "bin" / "java"
         self.work_dir = Path(__file__).parent
-        self.jdbc_jar = Path(
-            "/Users/rvillucci/Library/Application Support/JetBrains/"
-            "DataGrip2024.3/jdbc-drivers/Oracle/23.5/"
-            "com/oracle/database/jdbc/ojdbc11/23.5.0.24.07/"
-            "ojdbc11-23.5.0.24.07.jar"
-        )
+
+        # Try to find JDBC jar in project directory first, then fall back to environment variable
+        jdbc_jar_name = "ojdbc11-23.5.0.24.07.jar"
+        jdbc_jar_local = self.work_dir / jdbc_jar_name
+
+        if jdbc_jar_local.exists():
+            self.jdbc_jar = jdbc_jar_local
+        elif os.getenv("JDBC_JAR_PATH"):
+            self.jdbc_jar = Path(os.getenv("JDBC_JAR_PATH"))
+        else:
+            # Fall back to DataGrip location (may not exist for all users)
+            self.jdbc_jar = Path(
+                f"{Path.home()}/Library/Application Support/JetBrains/"
+                "DataGrip2024.3/jdbc-drivers/Oracle/23.5/"
+                "com/oracle/database/jdbc/ojdbc11/23.5.0.24.07/"
+                f"{jdbc_jar_name}"
+            )
+
         self.json_jar = self.work_dir / "json.jar"
 
         # Validate paths

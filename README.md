@@ -66,13 +66,14 @@ This implementation was created because **existing MCP solutions don't work** wi
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/oracle-mcp-server.git
-   cd oracle-mcp-server
+   git clone https://github.com/mofiaboss/oracle-mcp-sdm-with-guardrails.git
+   cd oracle-mcp-sdm-with-guardrails
    ```
 
 2. **Create virtual environment:**
    ```bash
-   python3 -m venv oracle_mcp_venv
+   # Use python3.10 or later (python3.12 recommended)
+   python3.12 -m venv oracle_mcp_venv
    source oracle_mcp_venv/bin/activate  # On Windows: oracle_mcp_venv\Scripts\activate
    ```
 
