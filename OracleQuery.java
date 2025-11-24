@@ -35,11 +35,21 @@ public class OracleQuery {
             // Load Oracle JDBC driver
             Class.forName("oracle.jdbc.driver.OracleDriver");
 
-            // Connect to database
+            // Connect to database with timeout
+            DriverManager.setLoginTimeout(5); // 5 second connection timeout
             conn = DriverManager.getConnection(url, user, password);
 
-            // Execute query
+            // Create statement with timeout and security settings
             stmt = conn.createStatement();
+
+            // CRITICAL SECURITY: Set query timeout to prevent resource exhaustion
+            stmt.setQueryTimeout(5); // 5 seconds max query execution
+
+            // Set fetch size to prevent memory exhaustion
+            stmt.setFetchSize(1000);
+
+            // Execute query (note: PreparedStatement not possible for dynamic queries)
+            // Security depends on validation in Python layer
             rs = stmt.executeQuery(query);
 
             // Get metadata
@@ -65,19 +75,44 @@ public class OracleQuery {
             output.put("count", results.length());
             System.out.println(output.toString());
 
-        } catch (Exception e) {
+        } catch (SQLException e) {
+            // SQL-specific errors - safe to return detailed message
             JSONObject error = new JSONObject();
             error.put("success", false);
-            error.put("error", e.getMessage());
+            error.put("error", "Database error: " + e.getMessage());
+            error.put("sql_state", e.getSQLState());
+            System.out.println(error.toString());
+            System.exit(1);
+        } catch (ClassNotFoundException e) {
+            // Driver not found
+            JSONObject error = new JSONObject();
+            error.put("success", false);
+            error.put("error", "JDBC driver not found");
+            System.out.println(error.toString());
+            System.exit(1);
+        } catch (Exception e) {
+            // Generic errors - don't leak implementation details
+            JSONObject error = new JSONObject();
+            error.put("success", false);
+            error.put("error", "Query execution failed");
             System.out.println(error.toString());
             System.exit(1);
         } finally {
+            // Ensure cleanup happens even if errors occur
             try {
                 if (rs != null) rs.close();
+            } catch (SQLException e) {
+                System.err.println("Warning: Failed to close ResultSet: " + e.getMessage());
+            }
+            try {
                 if (stmt != null) stmt.close();
+            } catch (SQLException e) {
+                System.err.println("Warning: Failed to close Statement: " + e.getMessage());
+            }
+            try {
                 if (conn != null) conn.close();
             } catch (SQLException e) {
-                // Ignore
+                System.err.println("Warning: Failed to close Connection: " + e.getMessage());
             }
         }
     }

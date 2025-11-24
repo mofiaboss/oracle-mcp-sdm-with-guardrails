@@ -8,6 +8,8 @@ import asyncio
 import json
 import logging
 import re
+import time
+from collections import deque
 from typing import Any
 from mcp.server import Server
 from mcp.types import (
@@ -30,6 +32,47 @@ server = Server("oracle-jdbc-server")
 # Global database connection and validator
 db: OracleJDBC = None
 validator: QueryValidator = None
+
+
+class RateLimiter:
+    """Simple rate limiter to prevent DoS attacks."""
+
+    def __init__(self, max_requests: int = 60, time_window: int = 60):
+        """
+        Initialize rate limiter.
+
+        Args:
+            max_requests: Maximum requests allowed in time window
+            time_window: Time window in seconds
+        """
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.requests = deque()
+
+    def is_allowed(self) -> tuple[bool, str]:
+        """
+        Check if a request is allowed.
+
+        Returns:
+            Tuple of (allowed, error_message)
+        """
+        now = time.time()
+
+        # Remove old requests outside the time window
+        while self.requests and self.requests[0] < now - self.time_window:
+            self.requests.popleft()
+
+        # Check if limit exceeded
+        if len(self.requests) >= self.max_requests:
+            return False, f"Rate limit exceeded: {self.max_requests} requests per {self.time_window} seconds"
+
+        # Record this request
+        self.requests.append(now)
+        return True, ""
+
+
+# Global rate limiter
+rate_limiter = RateLimiter(max_requests=60, time_window=60)
 
 
 def validate_identifier(identifier: str, max_length: int = 30) -> bool:
@@ -304,18 +347,34 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     text="Error: 'query' parameter is required"
                 )]
 
+            # SECURITY: Rate limiting check
+            allowed, rate_limit_error = rate_limiter.is_allowed()
+            if not allowed:
+                # AUDIT LOG: Rate limit exceeded
+                logger.warning(f"[AUDIT] RATE_LIMIT_EXCEEDED | {rate_limit_error}")
+                return [TextContent(
+                    type="text",
+                    text=f"Error: {rate_limit_error}. Please wait before retrying."
+                )]
+
+            # AUDIT LOG: Query attempt
+            logger.info(f"[AUDIT] Operation: query_oracle | Query length: {len(query)} chars")
+            logger.info(f"[AUDIT] Query preview: {query[:150]}...")
+
             # Validate query for safety
             validation = validator.validate(query)
 
             if not validation.is_safe:
+                # AUDIT LOG: Query blocked
+                logger.warning(f"[AUDIT] BLOCKED | Reason: {validation.error_message} | Complexity: {validation.complexity_score}")
+                logger.warning(f"[AUDIT] Blocked query: {query}")
+
                 error_response = {
                     "success": False,
                     "error": validation.error_message,
                     "complexity_score": validation.complexity_score,
                     "warnings": validation.warnings
                 }
-                logger.warning(f"Query blocked: {validation.error_message}")
-                logger.warning(f"Query: {query[:100]}...")
                 return [TextContent(
                     type="text",
                     text=json.dumps(error_response, indent=2)
@@ -340,6 +399,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 rows = result.get('rows', [])
                 count = result.get('count', 0)
 
+                # AUDIT LOG: Successful execution
+                logger.info(f"[AUDIT] SUCCESS | Rows returned: {count} | Complexity: {validation.complexity_score} | Row limit applied: {safe_query != query}")
+
                 response = {
                     "success": True,
                     "row_count": count,
@@ -357,6 +419,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 )]
             else:
                 error = result.get('error', 'Unknown error')
+                # AUDIT LOG: Execution failed
+                logger.error(f"[AUDIT] FAILED | Error: {error}")
                 return [TextContent(
                     type="text",
                     text=f"Error executing query: {error}"
@@ -370,8 +434,13 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     text="Error: 'table_name' parameter is required"
                 )]
 
+            # AUDIT LOG: describe_table attempt
+            logger.info(f"[AUDIT] Operation: describe_table | Table: {table_name}")
+
             # Validate table name to prevent SQL injection
             if not validate_identifier(table_name):
+                # AUDIT LOG: Invalid table name
+                logger.warning(f"[AUDIT] BLOCKED | Invalid table name: {table_name}")
                 return [TextContent(
                     type="text",
                     text=f"Error: Invalid table name '{table_name}'. Table names must start with a letter and contain only alphanumeric characters, underscores, $, or #."
@@ -410,6 +479,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
             pk_columns = [row['COLUMN_NAME'] for row in db.query(pk_query)]
 
+            # AUDIT LOG: Successful describe_table
+            logger.info(f"[AUDIT] SUCCESS | describe_table: {safe_table_name} | Columns: {len(columns)} | PKs: {len(pk_columns)}")
+
             response = {
                 "table_name": safe_table_name,
                 "columns": columns,
@@ -424,9 +496,14 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         elif name == "list_tables":
             schema = arguments.get("schema")
 
+            # AUDIT LOG: list_tables attempt
+            logger.info(f"[AUDIT] Operation: list_tables | Schema: {schema if schema else 'current_user'}")
+
             if schema:
                 # Validate schema name to prevent SQL injection
                 if not validate_identifier(schema):
+                    # AUDIT LOG: Invalid schema name
+                    logger.warning(f"[AUDIT] BLOCKED | Invalid schema name: {schema}")
                     return [TextContent(
                         type="text",
                         text=f"Error: Invalid schema name '{schema}'. Schema names must start with a letter and contain only alphanumeric characters, underscores, $, or #."
@@ -447,6 +524,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 """
 
             tables = db.query(query)
+
+            # AUDIT LOG: Successful list_tables
+            logger.info(f"[AUDIT] SUCCESS | list_tables | Schema: {schema.upper() if schema else 'current_user'} | Tables found: {len(tables)}")
 
             response = {
                 "schema": schema.upper() if schema else "current_user",

@@ -5,9 +5,14 @@ Works through StrongDM proxy on Apple Silicon.
 """
 
 import json
+import logging
+import os
 import subprocess
 from typing import List, Dict, Any, Optional
 from pathlib import Path
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 class OracleJDBC:
     """Oracle database connection using JDBC through Java subprocess."""
@@ -91,7 +96,6 @@ class OracleJDBC:
         classpath = f".:{self.json_jar}:{self.jdbc_jar}"
 
         # Set up environment with credentials (safer than command-line args)
-        import os
         env = os.environ.copy()
         env['ORACLE_USER'] = self.user
         env['ORACLE_PASSWORD'] = self.password
@@ -108,7 +112,7 @@ class OracleJDBC:
             cwd=str(self.work_dir),
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=5,  # SECURITY: 5 second timeout to prevent resource exhaustion
             env=env
         )
 
@@ -117,13 +121,15 @@ class OracleJDBC:
             response = json.loads(result.stdout)
             return response
         except json.JSONDecodeError as e:
-            # If JSON parsing fails, include raw output
+            # SECURITY: Don't leak stdout/stderr which may contain system paths, Java version, etc.
+            # Log internally but return generic error to client
+            logger.error(f"JSON parse error: {e}")
+            logger.error(f"stdout: {result.stdout}")
+            logger.error(f"stderr: {result.stderr}")
+            logger.error(f"returncode: {result.returncode}")
             return {
                 'success': False,
-                'error': f"Invalid JSON response: {e}",
-                'stdout': result.stdout,
-                'stderr': result.stderr,
-                'returncode': result.returncode
+                'error': "Database query failed - unable to parse response"
             }
 
     def query(self, sql: str) -> List[Dict[str, Any]]:

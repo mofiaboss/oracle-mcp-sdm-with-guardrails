@@ -157,8 +157,12 @@ class QueryValidator:
             complexity_score += 10
             warnings.append("SELECT * with multiple tables can be expensive. Consider specifying columns.")
 
-        # 8. Look for subqueries
-        subquery_count = query_upper.count('SELECT') - 1  # Subtract main SELECT
+        # 8. Look for subqueries (more accurately - find SELECT within parentheses)
+        # Pattern: ( ... SELECT ... ) indicates a subquery
+        # This is better than counting all SELECT keywords which can appear in strings/comments
+        subquery_pattern = r'\(\s*SELECT\s+'
+        subquery_matches = re.findall(subquery_pattern, query_upper)
+        subquery_count = len(subquery_matches)
         if subquery_count > 0:
             complexity_score += subquery_count * 10
             warnings.append(f"Query contains {subquery_count} subquery(ies). Monitor performance.")
