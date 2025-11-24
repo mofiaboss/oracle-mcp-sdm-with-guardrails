@@ -255,8 +255,55 @@ Blocked queries return detailed errors:
 
 ## 🔌 Available MCP Tools
 
+### 🎯 Recommended Query Workflow
+
+**For maximum safety, always preview queries before execution:**
+
+1. **Preview First:** Use `preview_query` to validate and see complexity score
+2. **Review:** Claude will show you the query and complexity details
+3. **Confirm:** Explicitly approve the query execution
+4. **Execute:** Claude will then use `query_oracle` to run it
+
+This two-step workflow ensures you're always aware of what will run against your database.
+
+### `preview_query` ⭐ **USE THIS FIRST**
+
+Preview and validate SQL queries WITHOUT executing them. Shows:
+- The exact query that will be executed
+- Complexity score (0-50, lower is simpler)
+- Any validation warnings or errors
+- Whether row limits will be applied
+- Safety assessment
+
+**Example:**
+```
+Preview this query: SELECT * FROM customers WHERE country = 'US'
+```
+
+**Response includes:**
+```json
+{
+  "preview_mode": true,
+  "query_to_execute": "SELECT * FROM customers WHERE country = 'US'",
+  "validation": {
+    "is_safe": true,
+    "complexity_score": 8,
+    "max_complexity": 50,
+    "complexity_explanation": "Lower is simpler. Score based on: JOINs (+5 each), subqueries (+3 each), GROUP BY (+2), aggregates (+1 each)",
+    "warnings": ["Table 'customers' used - ensure proper WHERE clause"]
+  },
+  "safety_limits": {
+    "max_rows": 10000,
+    "row_limit_will_be_applied": true
+  }
+}
+```
+
 ### `query_oracle`
+
 Execute SQL SELECT queries with safety validation.
+
+**Important:** Should only be called AFTER using `preview_query` and getting user confirmation.
 
 **Example:**
 ```

@@ -139,8 +139,40 @@ async def list_tools() -> list[Tool]:
     """List available database tools."""
     return [
         Tool(
+            name="preview_query",
+            description="""Preview and validate SQL query WITHOUT executing it.
+
+**USE THIS FIRST** before query_oracle to show the user:
+- The query that will be executed
+- Complexity score (0-50, lower is simpler)
+- Any validation warnings or errors
+- Whether the query is safe to execute
+
+Returns validation results only. Does NOT execute the query.
+
+**REQUIRED WORKFLOW:**
+1. Call preview_query first
+2. Show results to user with complexity score
+3. Get explicit user confirmation
+4. Only then call query_oracle to execute
+
+Example: preview_query with "SELECT * FROM users WHERE id = 123" """,
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "SQL query to preview and validate"
+                    }
+                },
+                "required": ["query"]
+            }
+        ),
+        Tool(
             name="query_oracle",
             description="""Execute SQL query on Oracle database.
+
+**IMPORTANT:** Must call preview_query FIRST and get user confirmation.
 
 Returns rows as JSON array. Use for SELECT queries.
 
@@ -221,7 +253,50 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     init_db()
 
     try:
-        if name == "query_oracle":
+        if name == "preview_query":
+            query = arguments.get("query")
+            if not query:
+                return [TextContent(
+                    type="text",
+                    text="Error: 'query' parameter is required"
+                )]
+
+            # Validate query for safety
+            validation = validator.validate(query)
+
+            # Determine if row limit would be applied
+            safe_query = validator.wrap_with_row_limit(query)
+            row_limit_applied = safe_query != query
+
+            # Build preview response
+            preview_response = {
+                "preview_mode": True,
+                "query_to_execute": query,
+                "safe_query_with_limit": safe_query if row_limit_applied else None,
+                "validation": {
+                    "is_safe": validation.is_safe,
+                    "complexity_score": validation.complexity_score,
+                    "max_complexity": validator.max_complexity,
+                    "complexity_explanation": "Lower is simpler. Score based on: JOINs (+5 each), subqueries (+3 each), GROUP BY (+2), aggregates (+1 each)",
+                    "warnings": validation.warnings if validation.warnings else [],
+                    "error_message": validation.error_message if not validation.is_safe else None
+                },
+                "safety_limits": {
+                    "max_rows": validator.max_rows,
+                    "row_limit_will_be_applied": row_limit_applied,
+                    "allow_cross_joins": validator.allow_cross_joins
+                },
+                "next_steps": "If query is safe and you approve, call query_oracle with the same query to execute it."
+            }
+
+            logger.info(f"Query preview - Complexity: {validation.complexity_score}, Safe: {validation.is_safe}")
+
+            return [TextContent(
+                type="text",
+                text=json.dumps(preview_response, indent=2)
+            )]
+
+        elif name == "query_oracle":
             query = arguments.get("query")
             if not query:
                 return [TextContent(
