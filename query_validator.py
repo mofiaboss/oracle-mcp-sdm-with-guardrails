@@ -7,6 +7,7 @@ Prevents dangerous queries like cross joins, cartesian products, and expensive o
 import re
 from typing import Tuple, List, Optional
 from dataclasses import dataclass
+from collections import Counter
 
 
 @dataclass
@@ -116,11 +117,11 @@ class QueryValidator:
                     error_message=f"Blocked operation detected: {pattern}. Only SELECT queries are allowed."
                 )
 
-        # 2. Must be a SELECT query
-        if not re.match(r'^\s*SELECT\b', query_upper):
+        # 2. Must be a SELECT query or CTE (WITH clause)
+        if not re.match(r'^\s*(SELECT|WITH)\b', query_upper):
             return ValidationResult(
                 is_safe=False,
-                error_message="Only SELECT queries are allowed."
+                error_message="Only SELECT queries (including CTEs with WITH clause) are allowed."
             )
 
         # 3. Check for dangerous patterns
@@ -167,18 +168,82 @@ class QueryValidator:
             complexity_score += subquery_count * 10
             warnings.append(f"Query contains {subquery_count} subquery(ies). Monitor performance.")
 
-        # 9. Check for DISTINCT
+            # Check for nested subquery depth (subqueries within subqueries)
+            # Nested depth adds additional complexity
+            if subquery_count > 2:
+                complexity_score += (subquery_count - 2) * 5
+                warnings.append(f"Deep nesting detected ({subquery_count} subqueries). This can significantly impact performance.")
+
+        # 9. Check for CTEs (WITH clauses)
+        cte_pattern = r'\bWITH\s+\w+\s+AS\s*\('
+        cte_matches = re.findall(cte_pattern, query_upper)
+        cte_count = len(cte_matches)
+        if cte_count > 0:
+            complexity_score += cte_count * 8
+            warnings.append(f"Query contains {cte_count} CTE(s) (WITH clause). CTEs can be expensive if not materialized.")
+
+        # 10. Check for window functions
+        window_functions = [
+            r'\bROW_NUMBER\s*\(',
+            r'\bRANK\s*\(',
+            r'\bDENSE_RANK\s*\(',
+            r'\bNTILE\s*\(',
+            r'\bLAG\s*\(',
+            r'\bLEAD\s*\(',
+            r'\bFIRST_VALUE\s*\(',
+            r'\bLAST_VALUE\s*\(',
+            r'\bPERCENT_RANK\s*\(',
+            r'\bCUME_DIST\s*\(',
+        ]
+        window_function_count = 0
+        for pattern in window_functions:
+            window_function_count += len(re.findall(pattern, query_upper))
+
+        if window_function_count > 0:
+            complexity_score += window_function_count * 12
+            warnings.append(f"Query contains {window_function_count} window function(s). Window functions can be very expensive on large datasets.")
+
+        # 11. Check for self-joins (same table appears multiple times)
+        # Look for table names after FROM or JOIN keywords
+        # Pattern: (FROM|JOIN) table_name [AS] alias
+        table_pattern = r'(?:FROM|JOIN)\s+([A-Z_][A-Z0-9_]*)\s+(?:AS\s+)?[A-Z_][A-Z0-9_]*'
+        table_references = re.findall(table_pattern, query_upper)
+        if table_references:
+            # Count duplicate table names (self-joins)
+            table_counts = Counter(table_references)
+            self_joins = sum(1 for table, count in table_counts.items() if count > 1)
+            if self_joins > 0:
+                complexity_score += self_joins * 15
+                warnings.append(f"Query contains {self_joins} self-join(s). Self-joins can create large intermediate result sets.")
+
+        # 12. Check for LIKE with leading wildcard (very expensive)
+        leading_wildcard_pattern = r"LIKE\s+['\"]%"
+        leading_wildcard_matches = re.findall(leading_wildcard_pattern, query_upper)
+        if leading_wildcard_matches:
+            leading_wildcard_count = len(leading_wildcard_matches)
+            complexity_score += leading_wildcard_count * 10
+            warnings.append(f"Query contains {leading_wildcard_count} LIKE pattern(s) with leading wildcard ('%...'). This prevents index usage and causes full table scans.")
+
+        # 13. Check for OR conditions (can prevent index usage)
+        or_pattern = r'\bOR\b'
+        or_matches = re.findall(or_pattern, query_upper)
+        or_count = len(or_matches)
+        if or_count > 2:  # More than 2 ORs is concerning
+            complexity_score += (or_count - 2) * 4
+            warnings.append(f"Query contains {or_count} OR condition(s). Multiple ORs can prevent index usage and degrade performance.")
+
+        # 14. Check for DISTINCT
         if 'DISTINCT' in query_upper:
             complexity_score += 5
             warnings.append("DISTINCT can be expensive on large result sets.")
 
-        # 10. Check for aggregate functions
+        # 15. Check for aggregate functions
         aggregates = ['COUNT', 'SUM', 'AVG', 'MAX', 'MIN', 'GROUP BY']
         aggregate_count = sum(1 for agg in aggregates if agg in query_upper)
         if aggregate_count > 0:
             complexity_score += aggregate_count * 3
 
-        # 11. Verify complexity score
+        # 16. Verify complexity score
         if complexity_score > self.max_complexity:
             return ValidationResult(
                 is_safe=False,

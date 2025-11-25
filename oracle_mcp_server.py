@@ -5,12 +5,14 @@ Works through StrongDM proxy on Apple Silicon.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
+import secrets
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Optional
 from mcp.server import Server
 from mcp.types import (
     Resource,
@@ -73,6 +75,230 @@ class RateLimiter:
 
 # Global rate limiter
 rate_limiter = RateLimiter(max_requests=60, time_window=60)
+
+
+class QueryApprovalTracker:
+    """
+    Tracks query approvals to enforce the approval workflow.
+    Ensures queries are previewed and explicitly approved before execution.
+    """
+
+    def __init__(self, token_expiry: int = 300):
+        """
+        Initialize query approval tracker.
+
+        Args:
+            token_expiry: Token expiry time in seconds (default: 5 minutes)
+        """
+        self.token_expiry = token_expiry
+        self.approvals = {}  # {token: {query_hash, timestamp, query_preview}}
+        self.lock = asyncio.Lock()
+
+    def _hash_query(self, query: str) -> str:
+        """
+        Generate hash of query for approval tracking.
+
+        Args:
+            query: SQL query
+
+        Returns:
+            SHA256 hash of normalized query
+        """
+        # Normalize query (strip whitespace, lowercase) for consistent hashing
+        normalized = ' '.join(query.strip().lower().split())
+        return hashlib.sha256(normalized.encode()).hexdigest()
+
+    async def generate_approval_token(self, query: str) -> str:
+        """
+        Generate approval token for a query.
+
+        Args:
+            query: SQL query that needs approval
+
+        Returns:
+            Approval token (32-character hex string)
+        """
+        async with self.lock:
+            # Generate secure random token
+            token = secrets.token_hex(16)  # 32 character hex string
+
+            # Store approval with metadata
+            self.approvals[token] = {
+                'query_hash': self._hash_query(query),
+                'timestamp': time.time(),
+                'query_preview': query[:100]  # Store preview for logging
+            }
+
+            # Clean up expired tokens
+            self._cleanup_expired()
+
+            logger.info(f"[APPROVAL] Generated token for query: {query[:50]}...")
+            return token
+
+    async def verify_approval(self, query: str, token: str) -> tuple[bool, str]:
+        """
+        Verify that query has been approved with valid token.
+
+        Args:
+            query: SQL query to execute
+            token: Approval token from preview_query
+
+        Returns:
+            Tuple of (is_approved, error_message)
+        """
+        async with self.lock:
+            # Clean up expired tokens first
+            self._cleanup_expired()
+
+            if not token:
+                return False, "No approval token provided. You must call preview_query first and include the approval_token in your query_oracle call."
+
+            # Check if token exists
+            if token not in self.approvals:
+                return False, "Invalid or expired approval token. Please call preview_query again to get a new approval token."
+
+            approval_data = self.approvals[token]
+            query_hash = self._hash_query(query)
+
+            # Verify query matches the approved query
+            if query_hash != approval_data['query_hash']:
+                logger.warning(f"[APPROVAL] Query hash mismatch for token {token}")
+                return False, "Query does not match approved query. The query you're trying to execute is different from the one you previewed."
+
+            # Token is valid - consume it (one-time use)
+            del self.approvals[token]
+
+            logger.info(f"[APPROVAL] Token verified and consumed for query: {query[:50]}...")
+            return True, ""
+
+    def _cleanup_expired(self):
+        """Remove expired approval tokens."""
+        now = time.time()
+        expired = [
+            token for token, data in self.approvals.items()
+            if now - data['timestamp'] > self.token_expiry
+        ]
+
+        for token in expired:
+            logger.info(f"[APPROVAL] Token expired: {token}")
+            del self.approvals[token]
+
+    def get_pending_approvals(self) -> int:
+        """Get count of pending approvals."""
+        self._cleanup_expired()
+        return len(self.approvals)
+
+
+# Global approval tracker
+approval_tracker = QueryApprovalTracker(token_expiry=300)  # 5 minute expiry
+
+
+class CircuitBreaker:
+    """
+    Circuit breaker pattern to prevent hammering a failing database.
+    States: CLOSED (normal), OPEN (failing), HALF_OPEN (testing recovery)
+    """
+
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 60, success_threshold: int = 2):
+        """
+        Initialize circuit breaker.
+
+        Args:
+            failure_threshold: Number of consecutive failures to open circuit
+            recovery_timeout: Seconds to wait before attempting recovery
+            success_threshold: Number of consecutive successes to close circuit
+        """
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.success_threshold = success_threshold
+
+        # Circuit state
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self.failure_count = 0
+        self.success_count = 0
+        self.last_failure_time = None
+        self.lock = asyncio.Lock()
+
+    async def call(self, func, *args, **kwargs):
+        """
+        Execute function through circuit breaker.
+
+        Args:
+            func: Function to execute
+            *args: Function arguments
+            **kwargs: Function keyword arguments
+
+        Returns:
+            Function result
+
+        Raises:
+            RuntimeError: If circuit is open
+        """
+        async with self.lock:
+            # Check circuit state
+            if self.state == "OPEN":
+                # Check if recovery timeout has elapsed
+                if time.time() - self.last_failure_time >= self.recovery_timeout:
+                    logger.info("[CIRCUIT_BREAKER] Entering HALF_OPEN state for recovery attempt")
+                    self.state = "HALF_OPEN"
+                    self.success_count = 0
+                else:
+                    # Circuit is open, reject request
+                    remaining = int(self.recovery_timeout - (time.time() - self.last_failure_time))
+                    logger.warning(f"[CIRCUIT_BREAKER] Circuit OPEN - rejecting request. Retry in {remaining}s")
+                    raise RuntimeError(f"Circuit breaker is OPEN. Database appears to be down. Retry in {remaining} seconds.")
+
+        # Execute function
+        try:
+            result = func(*args, **kwargs) if not asyncio.iscoroutinefunction(func) else await func(*args, **kwargs)
+
+            # Success - update circuit state
+            async with self.lock:
+                self.failure_count = 0
+
+                if self.state == "HALF_OPEN":
+                    self.success_count += 1
+                    if self.success_count >= self.success_threshold:
+                        logger.info(f"[CIRCUIT_BREAKER] Circuit CLOSED - database recovered after {self.success_count} successes")
+                        self.state = "CLOSED"
+                        self.success_count = 0
+
+            return result
+
+        except Exception as e:
+            # Failure - update circuit state
+            async with self.lock:
+                self.failure_count += 1
+                self.last_failure_time = time.time()
+                self.success_count = 0
+
+                if self.state == "HALF_OPEN":
+                    # Recovery attempt failed
+                    logger.warning("[CIRCUIT_BREAKER] Recovery attempt failed - returning to OPEN state")
+                    self.state = "OPEN"
+                elif self.failure_count >= self.failure_threshold:
+                    # Threshold exceeded
+                    logger.error(f"[CIRCUIT_BREAKER] Circuit OPEN - {self.failure_count} consecutive failures")
+                    self.state = "OPEN"
+
+            raise
+
+    def get_state(self) -> dict:
+        """Get current circuit breaker state."""
+        return {
+            'state': self.state,
+            'failure_count': self.failure_count,
+            'success_count': self.success_count,
+            'last_failure_time': self.last_failure_time
+        }
+
+
+# Global circuit breaker
+circuit_breaker = CircuitBreaker(
+    failure_threshold=5,     # Open after 5 consecutive failures
+    recovery_timeout=60,     # Wait 60 seconds before testing recovery
+    success_threshold=2      # Close after 2 consecutive successes
+)
 
 
 def validate_identifier(identifier: str, max_length: int = 30) -> bool:
@@ -215,33 +441,40 @@ Example: preview_query with "SELECT * FROM users WHERE id = 123" """,
             name="query_oracle",
             description="""Execute SQL query on Oracle database.
 
-**IMPORTANT:** Must call preview_query FIRST and get user confirmation.
-
-Returns rows as JSON array. Use for SELECT queries.
+**CRITICAL: APPROVAL WORKFLOW REQUIRED**
+1. Call preview_query FIRST to get validation results and approval_token
+2. Review complexity score, warnings, and query details
+3. Get explicit user confirmation
+4. Call this tool with BOTH the query AND the approval_token
 
 **SAFETY FEATURES:**
+- Enforces approval workflow (preview → approve → execute)
 - Blocks all write operations (INSERT/UPDATE/DELETE/DROP)
 - Prevents cartesian products and cross joins
 - Enforces maximum result size (10,000 rows)
 - Validates query complexity
 - Requires WHERE clauses on multi-table queries
+- Connection pool limited to 2 max connections
 
-Example queries:
-- SELECT * FROM users WHERE id = 123
-- SELECT COUNT(*) as total FROM orders
-- SELECT SYSDATE FROM DUAL
+Example usage:
+1. preview = preview_query(query="SELECT * FROM users WHERE id = 123")
+2. Get user approval and extract approval_token from preview response
+3. result = query_oracle(query="SELECT * FROM users WHERE id = 123", approval_token="<token>")
 
-Note: Query results are returned as list of dictionaries.
-Column names are uppercase. Validation warnings included in response.""",
+Note: Approval tokens expire after 5 minutes and are single-use.""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "SQL query to execute (SELECT statements only)"
+                        "description": "SQL query to execute (must match the query previewed)"
+                    },
+                    "approval_token": {
+                        "type": "string",
+                        "description": "Approval token received from preview_query (required for execution)"
                     }
                 },
-                "required": ["query"]
+                "required": ["query", "approval_token"]
             }
         ),
         Tool(
@@ -311,6 +544,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             safe_query = validator.wrap_with_row_limit(query)
             row_limit_applied = safe_query != query
 
+            # Generate approval token
+            approval_token = await approval_tracker.generate_approval_token(query)
+
             # Build preview response
             preview_response = {
                 "preview_mode": True,
@@ -320,7 +556,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     "is_safe": validation.is_safe,
                     "complexity_score": validation.complexity_score,
                     "max_complexity": validator.max_complexity,
-                    "complexity_explanation": "Lower is simpler. Score based on: JOINs (+5 each), subqueries (+3 each), GROUP BY (+2), aggregates (+1 each)",
+                    "complexity_explanation": "Lower is simpler. Score based on: JOINs (+5 each), subqueries (+10 each), GROUP BY (+2), aggregates (+3 each)",
                     "warnings": validation.warnings if validation.warnings else [],
                     "error_message": validation.error_message if not validation.is_safe else None
                 },
@@ -329,10 +565,15 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     "row_limit_will_be_applied": row_limit_applied,
                     "allow_cross_joins": validator.allow_cross_joins
                 },
-                "next_steps": "If query is safe and you approve, call query_oracle with the same query to execute it."
+                "approval": {
+                    "token": approval_token,
+                    "expires_in_seconds": 300,
+                    "message": "Include this approval_token when calling query_oracle to execute the query"
+                },
+                "next_steps": "If query is safe and you approve, call query_oracle with the same query AND the approval_token to execute it."
             }
 
-            logger.info(f"Query preview - Complexity: {validation.complexity_score}, Safe: {validation.is_safe}")
+            logger.info(f"Query preview - Complexity: {validation.complexity_score}, Safe: {validation.is_safe}, Token: {approval_token}")
 
             return [TextContent(
                 type="text",
@@ -341,10 +582,21 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
         elif name == "query_oracle":
             query = arguments.get("query")
+            approval_token = arguments.get("approval_token")
+
             if not query:
                 return [TextContent(
                     type="text",
                     text="Error: 'query' parameter is required"
+                )]
+
+            # CRITICAL: Verify approval token
+            is_approved, approval_error = await approval_tracker.verify_approval(query, approval_token)
+            if not is_approved:
+                logger.warning(f"[AUDIT] APPROVAL_DENIED | Query: {query[:50]}... | Reason: {approval_error}")
+                return [TextContent(
+                    type="text",
+                    text=f"Error: {approval_error}"
                 )]
 
             # SECURITY: Rate limiting check
@@ -357,8 +609,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     text=f"Error: {rate_limit_error}. Please wait before retrying."
                 )]
 
-            # AUDIT LOG: Query attempt
-            logger.info(f"[AUDIT] Operation: query_oracle | Query length: {len(query)} chars")
+            # AUDIT LOG: Query attempt (approved)
+            logger.info(f"[AUDIT] Operation: query_oracle | APPROVED | Query length: {len(query)} chars")
             logger.info(f"[AUDIT] Query preview: {query[:150]}...")
 
             # Validate query for safety
@@ -391,8 +643,16 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             if safe_query != query:
                 logger.info(f"Query wrapped with row limit: {validator.max_rows}")
 
-            # Execute query
-            result = db.execute(safe_query)
+            # Execute query through circuit breaker
+            try:
+                result = await circuit_breaker.call(db.execute, safe_query)
+            except RuntimeError as e:
+                # Circuit breaker is open
+                logger.error(f"[AUDIT] CIRCUIT_BREAKER_OPEN | {str(e)}")
+                return [TextContent(
+                    type="text",
+                    text=f"Error: {str(e)}"
+                )]
 
             if result.get('success'):
                 # Format response
@@ -463,7 +723,14 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 ORDER BY column_id
             """
 
-            columns = db.query(query)
+            try:
+                columns = await circuit_breaker.call(db.query, query)
+            except RuntimeError as e:
+                logger.error(f"[AUDIT] CIRCUIT_BREAKER_OPEN | describe_table: {safe_table_name}")
+                return [TextContent(
+                    type="text",
+                    text=f"Error: {str(e)}"
+                )]
 
             # Get primary key info
             pk_query = f"""
@@ -477,7 +744,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 )
             """
 
-            pk_columns = [row['COLUMN_NAME'] for row in db.query(pk_query)]
+            try:
+                pk_result = await circuit_breaker.call(db.query, pk_query)
+                pk_columns = [row['COLUMN_NAME'] for row in pk_result]
+            except RuntimeError as e:
+                logger.error(f"[AUDIT] CIRCUIT_BREAKER_OPEN | get primary keys: {safe_table_name}")
+                pk_columns = []  # Continue without PK info if circuit is open
 
             # AUDIT LOG: Successful describe_table
             logger.info(f"[AUDIT] SUCCESS | describe_table: {safe_table_name} | Columns: {len(columns)} | PKs: {len(pk_columns)}")
@@ -523,7 +795,14 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     ORDER BY table_name
                 """
 
-            tables = db.query(query)
+            try:
+                tables = await circuit_breaker.call(db.query, query)
+            except RuntimeError as e:
+                logger.error(f"[AUDIT] CIRCUIT_BREAKER_OPEN | list_tables: {schema if schema else 'current_user'}")
+                return [TextContent(
+                    type="text",
+                    text=f"Error: {str(e)}"
+                )]
 
             # AUDIT LOG: Successful list_tables
             logger.info(f"[AUDIT] SUCCESS | list_tables | Schema: {schema.upper() if schema else 'current_user'} | Tables found: {len(tables)}")
